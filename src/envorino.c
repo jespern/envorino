@@ -5,7 +5,6 @@
 
 #include <FreeRTOS.h>
 #include <task.h>
-//#include <ssid_config.h>
 
 #include <espressif/esp_sta.h>
 #include <espressif/esp_wifi.h>
@@ -20,12 +19,11 @@
 #define MQTT_PORT 1883
 
 #define MQTT_USER "envorino"
-#define MQTT_PASS "VQ6DCRTh7LN6kguUooNQLh>j6t7MeA^m"
+#define MQTT_PASS "********"
 
 #define WIFI_SSID "IoT"
-#define WIFI_PASS "3nAA3brcHo2n6smcQHpLK,E>sPV*2H#n"
+#define WIFI_PASS "********"
 
-// I2C interface defintions for ESP32 and ESP8266
 #define I2C_BUS       0 
 #define I2C_SCL_PIN   5 
 #define I2C_SDA_PIN   4
@@ -42,10 +40,11 @@ QueueHandle_t publish_queue;
 #define MQTT_BUF_LEN 256
 #define TOPIC_LEN 100
 
-struct measurement {
-    char* field;
-    float value;
-};
+#define GAS_BURNIN_CYCLES 50
+#define GAS_MIN_THRESHOLD 2500.0
+
+#define GAS_HUM_BASELINE 40.0
+#define GAS_HUM_WEIGHT 0.25
 
 static void measure_task(void *pvParameters) {
     while(1) {
@@ -56,15 +55,53 @@ static void measure_task(void *pvParameters) {
         TickType_t last_wakeup = xTaskGetTickCount();
         uint32_t duration = bme680_get_measurement_duration(sensor);
 
+        // IAQ burn-in
+        float gas_accum = 0;
+        int gas_cycles = 0;
+        float gas_baseline = 0;
+
         while(1) {
 	    if (bme680_force_measurement (sensor)) {
 	        vTaskDelay (duration);
 
 	        if (bme680_get_results_float (sensor, &values)) {
+                float iaq = 0.0;
+
+                if (gas_cycles >= GAS_BURNIN_CYCLES && gas_baseline == 0.0) {
+                    gas_baseline = gas_accum / gas_cycles;
+                } else if (gas_baseline == 0.0 && values.gas_resistance > GAS_MIN_THRESHOLD) {
+                    gas_accum += values.gas_resistance;
+                    gas_cycles++;
+                } else if (gas_baseline > 0) {
+                    float gas_offset = gas_baseline - values.gas_resistance;
+                    float hum_offset = GAS_HUM_BASELINE - values.humidity;
+                    float hum_score = 0.0;
+                    float gas_score = 0.0;
+
+                    if (hum_offset > 0) {
+                        hum_score = (100 - GAS_HUM_BASELINE - hum_offset);
+                        hum_score /= (100 - GAS_HUM_BASELINE);
+                        hum_score *= (GAS_HUM_WEIGHT * 100);
+                    } else {
+                        hum_score = (GAS_HUM_BASELINE + hum_offset);
+                        hum_score /= GAS_HUM_BASELINE;
+                        hum_score *= (GAS_HUM_WEIGHT * 100);
+                    }
+
+                    if (gas_offset > 0) {
+                        gas_score = (values.gas_resistance / gas_baseline);
+                        gas_score *= (100 - (GAS_HUM_WEIGHT * 100));
+                    } else {
+                        gas_score = 100 - (GAS_HUM_WEIGHT * 100);
+                    }
+
+                    iaq = gas_score + hum_score;
+                }
+
 		    char msg[PUB_MSG_LEN];
 		    snprintf(msg, PUB_MSG_LEN, 
-			     "humidity=%.2f temperature=%.2f gas_resistance=%.2f", 
-			     values.humidity, values.temperature, values.gas_resistance);
+			     "humidity=%.2f temperature=%.2f gas_resistance=%.2f,iaq=%.2f", 
+			     values.humidity, values.temperature, values.gas_resistance, iaq);
 		    if (xQueueSend(publish_queue, (void*)msg, 0) == pdFALSE) {
 	                printf("%s: publish queue overflow.\n", __func__);
 	            }
@@ -189,7 +226,7 @@ static void mqtt_task(void *pvParameters) {
 
 		mqtt_message_t message;
                 message.payload = rewrite;
-                message.payloadlen = PUB_MSG_LEN;
+                message.payloadlen = strlen(rewrite);
                 message.dup = 0;
                 message.qos = MQTT_QOS1;
                 message.retained = 0;
